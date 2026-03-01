@@ -1,0 +1,6 @@
+# IPSB HC2 Site Overlay (Scaffold placeholder)
+schema: 1
+site: "BWG - Bowling Green"
+routing:
+  default_assignment_group: "OPS"
+  rules: []

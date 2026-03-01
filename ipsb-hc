@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""
+IPSB/RDQM Health Check Framework - Step 2A (SDR Channel Discovery)
+
+Adds:
+- For each *active* QM on this node (per rdqmstatus "This node"), run:
+    echo "DIS CHSTATUS(*) WHERE(CHLTYPE EQ SDR)" | runmqsc <QM>
+  Parse channel status lines and store under:
+    discovery.channels_sdr[QMNAME][CHANNEL] = { "status": "...", "chltype": "SDR" }
+
+Still intentionally light on alerting:
+- Only emits findings for command execution failures (rdqmstatus/dspmq/runmqsc).
+- No "required channel" rules yet (that is Step 2B).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import fnmatch
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "0.5.3-step3Q.2"
+DEFAULT_ROOT = "/data/ipsb/monitor/hc2"
+DEFAULT_NODES = [1, 2, 3]
+
+
+
+def now_utc() -> _dt.datetime:
+    """Return timezone-aware UTC 'now'."""
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_name(name: str) -> str:
+    """Make a filesystem-safe name from a QM name."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+
+def state_dir(root: str) -> str:
+    return os.path.join(root, "state")
+
+
+def queue_flow_state_path(root: str, qm: str) -> str:
+    return os.path.join(state_dir(root), f"{safe_name(qm)}_queue_flow.json")
+CMD_RDQMSTATUS = "/opt/mqm/bin/rdqmstatus"
+CMD_DSPMQ = "/opt/mqm/bin/dspmq"
+CMD_RUNMQSC = "/opt/mqm/bin/runmqsc"
+
+FRAGMENT_STALE_MINUTES = 15
+RAW_HEAD_MAX_CHARS = 4000  # keep small; just for troubleshooting
+RUNMQSC_TIMEOUT_S = 35
+
+def utc_now() -> _dt.datetime:
+    return _dt.datetime.now(tz=_dt.timezone.utc)
+
+def iso(dt: _dt.datetime) -> str:
+    return dt.astimezone(_dt.timezone.utc).isoformat()
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def atomic_write_text(path: str, content: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def atomic_write_json(path: str, obj: Any) -> None:
+    atomic_write_text(path, json.dumps(obj, indent=2, sort_keys=True) + "\n")
+
+def write_breadcrumb(msg: str) -> None:
+    ts = iso(utc_now())
+    line = f"{ts} | {msg}\n"
+    try:
+        with open("/tmp/ipsb-hc-breadcrumb.log", "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+def require_mqm_or_warn() -> Optional[str]:
+    try:
+        import getpass
+        user = getpass.getuser()
+        if user != "mqm":
+            return f"Must run as mqm (current user: {user})"
+    except Exception:
+        return None
+    return None
+
+@dataclass
+class Finding:
+    priority: str
+    assignment_group: str
+    reason_code: str
+    domain: str
+    summary: str
+    node: Optional[str] = None
+    qm: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {
+            "priority": self.priority,
+            "assignment_group": self.assignment_group,
+            "reason_code": self.reason_code,
+            "domain": self.domain,
+            "summary": self.summary,
+            "node": self.node,
+        }
+        if self.qm:
+            d["qm"] = self.qm
+        return d
+
+def read_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        write_breadcrumb(f"Failed to read JSON {path}: {e}")
+        return None
+
+
+# ---- Config (Step 2B) --------------------------------------------------------
+def config_path(root: str) -> str:
+    return os.path.join(root, "config", "hc2.json")
+
+def default_config() -> Dict[str, Any]:
+    return {
+        "schema": 1,
+        "defaults": {
+            "assignment_group": "OPS",
+            "ignore_channel_patterns": ["SYSTEM.*"],
+            "required_sdr_channels": [],
+            "required_sdr_patterns": [],
+            "ignore_queue_patterns": ["SYSTEM.*", "AMQ.*"],
+            "required_queues": [],
+            "required_queue_patterns": [],
+            "queue_thresholds": {
+                "depth_warn": 500,
+                "depth_crit": 1000,
+                "pct_maxdepth_crit": 95
+            },
+            "queue_severity": {
+                "missing_required": "P2"
+            },
+            "queue_routing": {},
+            "routing": {},
+            "severity": {
+                "missing_required": "P2",
+                "stopped_required": "P3",
+                "retrying_required": "P4",
+            },
+        },
+        "qmgrs": {},
+    }
+
+def load_or_bootstrap_config(root: str, discovered_qms: List[str]) -> Dict[str, Any]:
+    path = config_path(root)
+    cfg = read_json_file(path)
+    if not isinstance(cfg, dict) or cfg.get("schema") != 1:
+        cfg = default_config()
+
+    cfg.setdefault("defaults", {})
+    cfg.setdefault("qmgrs", {})
+
+    qmgrs = cfg.get("qmgrs")
+    if not isinstance(qmgrs, dict):
+        qmgrs = {}
+        cfg["qmgrs"] = qmgrs
+
+    changed = False
+    for qm in discovered_qms:
+        if qm not in qmgrs:
+            qmgrs[qm] = {
+                "assignment_group": cfg["defaults"].get("assignment_group", "OPS"),
+                "ignore_channel_patterns": [],
+                "required_sdr_channels": [],
+                "required_sdr_patterns": [],
+            "ignore_queue_patterns": ["SYSTEM.*", "AMQ.*"],
+            "required_queues": [],
+            "required_queue_patterns": [],
+            "queue_thresholds": {
+                "depth_warn": 500,
+                "depth_crit": 1000,
+                "pct_maxdepth_crit": 95
+            },
+            "queue_severity": {
+                "missing_required": "P2"
+            },
+            "queue_routing": {},
+                "routing": {},
+                "severity": {},
+                "ignore_queue_patterns": [],
+                "required_queues": [],
+                "required_queue_patterns": [],
+                "queue_thresholds": {},
+                "queue_overrides": {},
+                "queue_pattern_overrides": [],
+                "queue_routing": {},
+                "queue_pattern_routing": [],
+            }
+            changed = True
+
+    try:
+        ensure_dir(os.path.dirname(path))
+        if (read_json_file(path) is None) or changed:
+            atomic_write_json(path, cfg)
+    except Exception as e:
+        write_breadcrumb(f"Config bootstrap/write failed at {path}: {e}")
+
+    return cfg
+
+def _merge_list(a: Any, b: Any) -> List[str]:
+    out: List[str] = []
+    for x in (a or []):
+        if isinstance(x, str):
+            out.append(x)
+    for x in (b or []):
+        if isinstance(x, str):
+            out.append(x)
+    seen=set()
+    dedup=[]
+    for x in out:
+        if x not in seen:
+            dedup.append(x); seen.add(x)
+    return dedup
+
+def _merge_dict(a: Any, b: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if isinstance(a, dict):
+        for k, v in a.items():
+            if isinstance(k, str) and isinstance(v, str):
+                out[k] = v
+    if isinstance(b, dict):
+        for k, v in b.items():
+            if isinstance(k, str) and isinstance(v, str):
+                out[k] = v
+    return out
+
+def evaluate_required_sdr_channels(
+    cfg: Dict[str, Any],
+    qm: str,
+    sdr_map: Dict[str, Dict[str, Any]],
+    node_host: str,
+) -> List[Finding]:
+    findings: List[Finding] = []
+    defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    qcfg = (cfg.get("qmgrs") or {}).get(qm, {}) if isinstance(cfg.get("qmgrs"), dict) else {}
+    if not isinstance(qcfg, dict):
+        qcfg = {}
+
+    assignment_default = qcfg.get("assignment_group") or defaults.get("assignment_group") or "OPS"
+    ignore_patterns = _merge_list(defaults.get("ignore_channel_patterns"), qcfg.get("ignore_channel_patterns"))
+    req_channels = _merge_list(defaults.get("required_sdr_channels"), qcfg.get("required_sdr_channels"))
+    req_patterns = _merge_list(defaults.get("required_sdr_patterns"), qcfg.get("required_sdr_patterns"))
+    routing = _merge_dict(defaults.get("routing"), qcfg.get("routing"))
+    sev = _merge_dict(defaults.get("severity"), qcfg.get("severity"))
+
+    sev_missing = sev.get("missing_required", "P2")
+    sev_stopped = sev.get("stopped_required", "P3")
+    sev_retrying = sev.get("retrying_required", "P4")
+
+    def is_ignored(ch: str) -> bool:
+        for pat in ignore_patterns:
+            if fnmatch.fnmatch(ch, pat):
+                return True
+        return False
+
+    required: List[str] = []
+    for ch in req_channels:
+        if ch not in required:
+            required.append(ch)
+    for pat in req_patterns:
+        for ch, meta in sdr_map.items():
+            if meta.get("defined") is True and fnmatch.fnmatch(ch, pat) and ch not in required:
+                required.append(ch)
+
+    for ch in required:
+        meta = sdr_map.get(ch)
+        if meta is None:
+            ag = routing.get(ch, assignment_default)
+            findings.append(Finding(
+                priority=sev_missing,
+                assignment_group=ag,
+                reason_code="REQ_SDR_MISSING",
+                domain="mq.channels",
+                summary=f"Required SDR channel not defined: {qm}:{ch}",
+                node=node_host,
+                qm=qm,
+            ))
+            continue
+
+        # Option A: NO_STATUS is neutral
+        status = (meta.get("status") or "UNKNOWN").upper()
+        if status in ("NO_STATUS", "UNKNOWN"):
+            continue
+
+        if is_ignored(ch) and ch not in req_channels and not any(fnmatch.fnmatch(ch, p) for p in req_patterns):
+            continue
+
+        if status in ("RETRYING", "PAUSED", "STOPPING"):
+            ag = routing.get(ch, assignment_default)
+            findings.append(Finding(
+                priority=sev_retrying,
+                assignment_group=ag,
+                reason_code="REQ_SDR_NOT_HEALTHY",
+                domain="mq.channels",
+                summary=f"Required SDR channel unhealthy ({status}): {qm}:{ch}",
+                node=node_host,
+                qm=qm,
+            ))
+        elif status in ("STOPPED", "INACTIVE", "ENDED"):
+            ag = routing.get(ch, assignment_default)
+            findings.append(Finding(
+                priority=sev_stopped,
+                assignment_group=ag,
+                reason_code="REQ_SDR_STOPPED",
+                domain="mq.channels",
+                summary=f"Required SDR channel stopped/inactive ({status}): {qm}:{ch}",
+                node=node_host,
+                qm=qm,
+            ))
+
+    return findings
+
+# ---- Queue Monitoring (Step 3Q) ----------------------------------------------
+
+def state_dir(root: str) -> str:
+    return os.path.join(root, "state")
+
+def queue_state_path(root: str, qm: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", qm)
+    return os.path.join(state_dir(root), f"{safe_name(qm)}_queue_seen.json")
+
+def load_queue_state(root: str, qm: str) -> Dict[str, Any]:
+    st = read_json_file(queue_state_path(root, qm))
+    if not isinstance(st, dict) or st.get("schema") != 1:
+        st = {"schema": 1, "seen": {}, "updated_at": None}
+    st.setdefault("seen", {})
+    return st
+
+def save_queue_state(root: str, qm: str, st: Dict[str, Any]) -> None:
+    ensure_dir(state_dir(root))
+    st["updated_at"] = now_utc().isoformat()
+    atomic_write_json(queue_state_path(root, qm), st)
+
+def _thresholds_from_cfg(cfg: Dict[str, Any], qm: str, qname: str) -> Dict[str, Any]:
+    defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    qmgrs = cfg.get("qmgrs") if isinstance(cfg.get("qmgrs"), dict) else {}
+    qcfg = qmgrs.get(qm, {}) if isinstance(qmgrs.get(qm, {}), dict) else {}
+
+    base: Dict[str, Any] = {}
+    if isinstance(defaults.get("queue_thresholds"), dict):
+        base.update(defaults["queue_thresholds"])
+    if isinstance(qcfg.get("queue_thresholds"), dict):
+        base.update(qcfg["queue_thresholds"])
+
+    pat_list = qcfg.get("queue_pattern_overrides", [])
+    if isinstance(pat_list, list):
+        for item in pat_list:
+            if not isinstance(item, dict):
+                continue
+            pat = item.get("pattern")
+            thr = item.get("thresholds")
+            if isinstance(pat, str) and isinstance(thr, dict) and fnmatch.fnmatch(qname, pat):
+                base.update({k: v for k, v in thr.items()})
+
+    ov = qcfg.get("queue_overrides")
+    if isinstance(ov, dict):
+        thr = ov.get(qname)
+        if isinstance(thr, dict):
+            base.update({k: v for k, v in thr.items()})
+
+    return base
+
+def _queue_assignment_group(cfg: Dict[str, Any], qm: str, qname: str) -> str:
+    defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    qmgrs = cfg.get("qmgrs") if isinstance(cfg.get("qmgrs"), dict) else {}
+    qcfg = qmgrs.get(qm, {}) if isinstance(qmgrs.get(qm, {}), dict) else {}
+
+    ag = defaults.get("assignment_group", "OPS")
+    if isinstance(qcfg.get("assignment_group"), str):
+        ag = qcfg["assignment_group"]
+
+    # exact routing
+    gqroute = defaults.get("queue_routing", {})
+    if isinstance(gqroute, dict) and isinstance(gqroute.get(qname), str):
+        ag = gqroute[qname]
+    qroute = qcfg.get("queue_routing", {})
+    if isinstance(qroute, dict) and isinstance(qroute.get(qname), str):
+        ag = qroute[qname]
+
+    # pattern routing (qm-level)
+    pr = qcfg.get("queue_pattern_routing", [])
+    if isinstance(pr, list):
+        for item in pr:
+            if not isinstance(item, dict):
+                continue
+            pat = item.get("pattern")
+            ag2 = item.get("assignment_group")
+            if isinstance(pat, str) and isinstance(ag2, str) and fnmatch.fnmatch(qname, pat):
+                ag = ag2
+    return ag
+
+def _queue_is_ignored(cfg: Dict[str, Any], qm: str, qname: str) -> bool:
+    defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    qmgrs = cfg.get("qmgrs") if isinstance(cfg.get("qmgrs"), dict) else {}
+    qcfg = qmgrs.get(qm, {}) if isinstance(qmgrs.get(qm, {}), dict) else {}
+
+    pats: List[str] = []
+    if isinstance(defaults.get("ignore_queue_patterns"), list):
+        pats.extend([p for p in defaults["ignore_queue_patterns"] if isinstance(p, str)])
+    if isinstance(qcfg.get("ignore_queue_patterns"), list):
+        pats.extend([p for p in qcfg["ignore_queue_patterns"] if isinstance(p, str)])
+    return any(fnmatch.fnmatch(qname, pat) for pat in pats)
+
+def _required_queue_set(cfg: Dict[str, Any], qm: str, discovered: Dict[str, Dict[str, Any]]) -> List[str]:
+    defaults = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    qmgrs = cfg.get("qmgrs") if isinstance(cfg.get("qmgrs"), dict) else {}
+    qcfg = qmgrs.get(qm, {}) if isinstance(qmgrs.get(qm, {}), dict) else {}
+
+    req: List[str] = []
+    for q in (defaults.get("required_queues") or []):
+        if isinstance(q, str) and q not in req:
+            req.append(q)
+    for q in (qcfg.get("required_queues") or []):
+        if isinstance(q, str) and q not in req:
+            req.append(q)
+
+    pats: List[str] = []
+    for p in (defaults.get("required_queue_patterns") or []):
+        if isinstance(p, str): pats.append(p)
+    for p in (qcfg.get("required_queue_patterns") or []):
+        if isinstance(p, str): pats.append(p)
+
+    for pat in pats:
+        for qname in discovered.keys():
+            if fnmatch.fnmatch(qname, pat) and qname not in req:
+                req.append(qname)
+    return req
+
+def parse_dis_qlocal_curdepth(text: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    q: Optional[str] = None
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.search(r"QUEUE\(([^)]+)\)", line, re.IGNORECASE)
+        if m:
+            q = m.group(1).strip()
+            if q == "*":
+                q = None
+                continue
+            out.setdefault(q, {})
+        if q:
+            m2 = re.search(r"CURDEP\((\d+)\)", line, re.IGNORECASE)
+            if m2:
+                out[q]["curdepth"] = int(m2.group(1))
+            m3 = re.search(r"MAXDEPTH\((\d+)\)", line, re.IGNORECASE)
+            if m3:
+                out[q]["maxdepth"] = int(m3.group(1))
+    return out
+
+def evaluate_queue_depths(root: str, cfg: Dict[str, Any], qm: str, qdepths: Dict[str, Dict[str, Any]], node_host: str) -> List[Finding]:
+    findings: List[Finding] = []
+    st = load_queue_state(root, qm)
+    seen = st.get("seen", {}) if isinstance(st.get("seen", {}), dict) else {}
+    now = now_utc().isoformat()
+
+    # learn
+    for qname, meta in qdepths.items():
+        cur = int(meta.get("curdepth", 0) or 0)
+        if cur > 0:
+            prev = seen.get(qname, {})
+            seen[qname] = {"first_seen": prev.get("first_seen", now), "last_nonzero": now}
+    st["seen"] = seen
+    save_queue_state(root, qm, st)
+
+    candidates = set(_required_queue_set(cfg, qm, qdepths))
+    candidates.update(seen.keys())
+
+    required = _required_queue_set(cfg, qm, qdepths)
+    sev_missing = ((cfg.get("defaults", {}).get("queue_severity", {}) or {}).get("missing_required", "P2"))
+    for rq in required:
+        if rq not in qdepths and not _queue_is_ignored(cfg, qm, rq):
+            ag = _queue_assignment_group(cfg, qm, rq)
+            findings.append(Finding(priority=sev_missing, assignment_group=ag, reason_code="REQ_QUEUE_MISSING",
+                                    domain="mq.queues", summary=f"Required local queue not defined: {qm}:{rq}",
+                                    node=node_host, qm=qm))
+
+    for qname in sorted(candidates):
+        if qname not in qdepths or _queue_is_ignored(cfg, qm, qname):
+            continue
+        meta = qdepths[qname]
+        cur = int(meta.get("curdepth", 0) or 0)
+        maxd = int(meta.get("maxdepth", 0) or 0)
+
+        thr = _thresholds_from_cfg(cfg, qm, qname)
+        depth_warn = int(thr.get("depth_warn", 0) or 0)
+        depth_crit = int(thr.get("depth_crit", 0) or 0)
+        pct_crit = int(thr.get("pct_maxdepth_crit", 0) or 0)
+
+        ag = _queue_assignment_group(cfg, qm, qname)
+
+        if pct_crit > 0 and maxd > 0 and cur > 0:
+            pct = int((cur * 100) / maxd)
+            if pct >= pct_crit:
+                findings.append(Finding(priority="P2", assignment_group=ag, reason_code="Q_NEAR_MAXDEPTH",
+                                        domain="mq.queues",
+                                        summary=f"Queue near MAXDEPTH ({pct}%): {qm}:{qname} CURDEP={cur} MAXDEPTH={maxd}",
+                                        node=node_host, qm=qm))
+
+        if depth_crit > 0 and cur >= depth_crit:
+            findings.append(Finding(priority="P2", assignment_group=ag, reason_code="Q_DEPTH_HIGH",
+                                    domain="mq.queues",
+                                    summary=f"Queue depth high (crit): {qm}:{qname} CURDEP={cur} (>= {depth_crit})",
+                                    node=node_host, qm=qm))
+        elif depth_warn > 0 and cur >= depth_warn:
+            findings.append(Finding(priority="P3", assignment_group=ag, reason_code="Q_DEPTH_HIGH",
+                                    domain="mq.queues",
+                                    summary=f"Queue depth high (warn): {qm}:{qname} CURDEP={cur} (>= {depth_warn})",
+                                    node=node_host, qm=qm))
+    return findings
+
+# -----------------------------------------------------------------------------
+
+
+def get_queue_flow_policy(cfg: Dict[str, Any], qm: str, qname: str) -> Dict[str, Any]:
+    """Return effective flow policy for a queue (stale detection)."""
+    defaults = (cfg.get("defaults", {}) or {}).get("queue_flow", {}) or {}
+    qmgrs = cfg.get("qmgrs", {}) or {}
+    qcfg = (qmgrs.get(qm, {}) or {})
+
+    pol: Dict[str, Any] = {
+        "stale_runs": int(defaults.get("stale_runs", 3)),
+        "min_depth": int(defaults.get("min_depth", 1)),
+        "priority": str(defaults.get("priority", "P3")),
+        "assignment_group": str(defaults.get("assignment_group", "OPS")),
+        "exclude_system": bool(defaults.get("exclude_system", True)),
+    }
+
+    qmf = (qcfg.get("queue_flow", {}) or {})
+    for k in ["stale_runs", "min_depth", "priority", "assignment_group", "exclude_system"]:
+        if k in qmf:
+            pol[k] = qmf[k]
+
+    for rule in (qcfg.get("queue_pattern_overrides", []) or []):
+        pat = rule.get("pattern")
+        if not pat:
+            continue
+        if fnmatch.fnmatchcase(qname, pat):
+            flow = (rule.get("flow", {}) or {})
+            for k in ["stale_runs", "min_depth", "priority"]:
+                if k in flow:
+                    pol[k] = flow[k]
+            if "assignment_group" in rule:
+                pol["assignment_group"] = rule["assignment_group"]
+
+    q_over = (qcfg.get("queue_overrides", {}) or {}).get(qname, None)
+    if isinstance(q_over, dict):
+        flow = (q_over.get("flow", {}) or {})
+        for k in ["stale_runs", "min_depth", "priority"]:
+            if k in flow:
+                pol[k] = flow[k]
+        if "assignment_group" in q_over:
+            pol["assignment_group"] = q_over["assignment_group"]
+        if "priority" in q_over:
+            pol["priority"] = q_over["priority"]
+
+    try:
+        pol["stale_runs"] = max(1, int(pol.get("stale_runs", 3)))
+    except Exception:
+        pol["stale_runs"] = 3
+    try:
+        pol["min_depth"] = max(1, int(pol.get("min_depth", 1)))
+    except Exception:
+        pol["min_depth"] = 1
+    pol["priority"] = str(pol.get("priority", "P3"))
+    pol["assignment_group"] = str(pol.get("assignment_group", "OPS"))
+    pol["exclude_system"] = bool(pol.get("exclude_system", True))
+    return pol
+
+
+def load_json_file(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json_file(path: str, obj: Any) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def update_queue_flow_state(root: str, cfg: Dict[str, Any], qm: str, qdepths: Dict[str, Any], hostname: str) -> List[Finding]:
+    """Track per-queue depth stagnation across runs and emit findings."""
+    ensure_dir(state_dir(root))
+    path = queue_flow_state_path(root, qm)
+    now = now_utc().isoformat()
+
+    try:
+        state = load_json_file(path)
+        if not isinstance(state, dict):
+            state = {}
+    except FileNotFoundError:
+        state = {}
+    except Exception:
+        state = {}
+
+    findings: List[Finding] = []
+    new_state: Dict[str, Any] = {}
+
+    for qname, meta in (qdepths or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        cur = int(meta.get("curdepth", 0))
+        pol = get_queue_flow_policy(cfg, qm, qname)
+
+        if pol.get("exclude_system", True) and qname.upper().startswith("SYSTEM."):
+            continue
+
+        min_depth = int(pol.get("min_depth", 1))
+        stale_runs = int(pol.get("stale_runs", 3))
+
+        prev = state.get(qname, {}) if isinstance(state.get(qname, {}), dict) else {}
+        last_depth = int(prev.get("last_depth", -1)) if "last_depth" in prev else -1
+        streak = int(prev.get("streak", 0)) if "streak" in prev else 0
+        last_change = str(prev.get("last_change", now))
+
+        if cur < min_depth:
+            # Below tracking threshold: reset streak, but only update last_change
+            # if the depth actually changed since the last run.
+            if last_depth != cur:
+                last_change = now
+            new_state[qname] = {"last_depth": cur, "streak": 0, "last_change": last_change}
+            continue
+
+        if last_depth == cur:
+            streak = streak + 1
+        else:
+            streak = 0
+            last_change = now
+
+        new_state[qname] = {"last_depth": cur, "streak": streak, "last_change": last_change}
+
+        if streak >= stale_runs:
+            findings.append(Finding(
+                priority=str(pol.get("priority", "P3")),
+                assignment_group=str(pol.get("assignment_group", "OPS")),
+                reason_code="Q_STALE_DEPTH",
+                domain="mq.queues.flow",
+                summary=f"Queue {qname} on {qm} depth={cur} unchanged for {streak} runs (threshold={stale_runs})",
+                node=hostname,
+                qm=qm,
+                queue=qname,
+            ))
+
+    try:
+        save_json_file(path, new_state)
+    except Exception:
+        pass
+
+    return findings
+
+def parse_iso(ts: str) -> Optional[_dt.datetime]:
+    try:
+        return _dt.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def fragment_paths(root: str, node_id: int) -> Tuple[str, str]:
+    d = os.path.join(root, "fragments", f"node{node_id}")
+    return os.path.join(d, "latest.json"), os.path.join(d, "heartbeat")
+
+def instance_path(root: str) -> str:
+    return os.path.join(root, "instance", "INSTANCE.json")
+
+def instance_hb_path(root: str) -> str:
+    return os.path.join(root, "instance", "HEARTBEAT")
+
+def run_cmd_combined(cmd: List[str], timeout_s: int = 30, input_text: Optional[str] = None) -> Tuple[int, str]:
+    """Capture stdout+stderr combined to avoid surprises under cron/non-tty."""
+    try:
+        p = subprocess.run(
+            cmd,
+            text=True,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+            check=False,
+        )
+        return p.returncode, p.stdout or ""
+    except FileNotFoundError:
+        return 127, f"Command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"Timeout after {timeout_s}s: {' '.join(cmd)}"
+    except Exception as e:
+        return 1, f"Exception running {' '.join(cmd)}: {e}"
+
+def parse_dspmq(text: str) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("QMNAME("):
+            continue
+        m = re.search(r"QMNAME\(([^)]+)\)\s+STATUS\(([^)]+)\)", line)
+        if not m:
+            continue
+        qm, status = m.group(1).strip(), m.group(2).strip()
+        out[qm] = {"status": status}
+    return out
+
+def parse_rdqmstatus(text: str) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    current_qm: Optional[str] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Queue manager name"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                current_qm = parts[1].strip()
+                if current_qm:
+                    out.setdefault(current_qm, {})
+            continue
+        if current_qm is None:
+            continue
+        if line.startswith("Queue manager status"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                out[current_qm]["qm_status"] = parts[1].strip()
+        elif line.startswith("HA status"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                out[current_qm]["ha_status"] = parts[1].strip()
+        elif line.startswith("HA current location"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                out[current_qm]["ha_current_location"] = parts[1].strip()
+        elif line.startswith("HA preferred location"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                out[current_qm]["ha_preferred_location"] = parts[1].strip()
+        elif line.startswith("HA blocked location"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                out[current_qm]["ha_blocked_location"] = parts[1].strip()
+    return out
+
+def active_qms_on_this_node(rdqm: Dict[str, Dict[str, str]]) -> List[str]:
+    active: List[str] = []
+    for qm, info in rdqm.items():
+        loc = (info.get("ha_current_location") or "").strip()
+        qm_status = (info.get("qm_status") or "").strip()
+        if loc == "This node" and qm_status in ("Running", "Running (standby)", "Running standby", "Running"):
+            active.append(qm)
+    return sorted(set(active))
+
+def parse_runmqsc_chstatus_sdr(text: str) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    channels: Dict[str, Dict[str, str]] = {}
+    errors: List[str] = []
+
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("AMQ") and (("E:" in s) or ("W:" in s) or ("I:" in s)):
+            errors.append(s[:200])
+
+    rx = re.compile(r"CHANNEL\(([^)]+)\).*?CHLTYPE\(([^)]+)\).*?STATUS\(([^)]+)\)", re.IGNORECASE)
+    for line in text.splitlines():
+        m = rx.search(line)
+        if not m:
+            continue
+        ch = m.group(1).strip()
+        chltype = m.group(2).strip().upper()
+        status = m.group(3).strip().upper()
+        if chltype == "SDR":
+            channels[ch] = {"chltype": "SDR", "status": status}
+
+    return channels, errors
+
+def run_runmqsc(qm: str, mqsc: str, timeout_s: int = RUNMQSC_TIMEOUT_S) -> Tuple[int, str]:
+    return run_cmd_combined([CMD_RUNMQSC, qm], timeout_s=timeout_s, input_text=mqsc)
+
+def cmd_run(args: argparse.Namespace) -> int:
+    err = require_mqm_or_warn()
+    hostname = socket.gethostname()
+    start = utc_now()
+    run_id = str(uuid.uuid4())
+
+    frag: Dict[str, Any] = {
+        "schema": 1,
+        "version": VERSION,
+        "node_id": args.node_id,
+        "hostname": hostname,
+        "run_id": run_id,
+        "run_start": iso(start),
+        "run_end": None,
+        "status": "RUNNING",
+        "warnings": [],
+        "findings": [],
+        "discovery": {},
+    }
+
+    if err:
+        frag["warnings"].append(err)
+        frag["findings"].append(Finding(
+            priority="P4",
+            assignment_group="OPS",
+            reason_code="EXEC_NOT_MQM",
+            domain="framework",
+            summary=err,
+            node=hostname,
+        ).to_dict())
+
+    try:
+        frag_json, hb = fragment_paths(args.root, args.node_id)
+        ensure_dir(os.path.dirname(frag_json))
+        atomic_write_json(frag_json, frag)
+    except Exception as e:
+        write_breadcrumb(f"run(node{args.node_id}) cannot write fragment to shared root {args.root}: {e}")
+        return 2
+
+    # rdqmstatus
+    rc, out = run_cmd_combined([CMD_RDQMSTATUS], timeout_s=30)
+    frag["discovery"]["rdqmstatus_rc"] = rc
+    if rc != 0:
+        frag["findings"].append(Finding(
+            priority="P2",
+            assignment_group="OPS",
+            reason_code="RDQMSTATUS_CMD_FAIL",
+            domain="rdqm",
+            summary=f"rdqmstatus failed rc={rc}: {(out.strip() or 'no output')[:200]}",
+            node=hostname,
+        ).to_dict())
+        frag["discovery"]["rdqm"] = {}
+    else:
+        rdqm = parse_rdqmstatus(out)
+        frag["discovery"]["rdqm"] = rdqm
+        if not rdqm:
+            frag["discovery"]["rdqmstatus_raw_head"] = out[:RAW_HEAD_MAX_CHARS]
+            frag["findings"].append(Finding(
+                priority="P3",
+                assignment_group="OPS",
+                reason_code="RDQM_PARSE_EMPTY",
+                domain="rdqm",
+                summary="rdqmstatus rc=0 but parser produced no QM blocks (see discovery.rdqmstatus_raw_head)",
+                node=hostname,
+            ).to_dict())
+
+    # dspmq
+    rc2, out2 = run_cmd_combined([CMD_DSPMQ], timeout_s=30)
+    frag["discovery"]["dspmq_rc"] = rc2
+    if rc2 != 0:
+        frag["findings"].append(Finding(
+            priority="P2",
+            assignment_group="OPS",
+            reason_code="DSPMQ_CMD_FAIL",
+            domain="mq",
+            summary=f"dspmq failed rc={rc2}: {(out2.strip() or 'no output')[:200]}",
+            node=hostname,
+        ).to_dict())
+        frag["discovery"]["dspmq"] = {}
+    else:
+        frag["discovery"]["dspmq"] = parse_dspmq(out2)
+    # SDR channel discovery (Step 2A.2)
+    rdqm_map = frag["discovery"].get("rdqm") or {}
+    if isinstance(rdqm_map, dict) and rdqm_map:
+        active_qms = active_qms_on_this_node(rdqm_map)
+        frag["discovery"]["active_qms"] = active_qms
+
+        # Gather SDR channels in two passes:
+        #  1) Defined SDR channels (stable inventory): DIS CHANNEL(*) CHLTYPE(SDR)
+        #  2) Status records for SDR channels (runtime state, may be empty): DIS CHSTATUS(*) WHERE(CHLTYPE EQ SDR)
+        #
+        # Merge into:
+        #   discovery.channels_sdr[QM][CHANNEL] =
+        #     {"chltype":"SDR","defined":true|false,"status":"RUNNING|...|NO_STATUS","is_system":true|false}
+
+        mqsc_defined = "DIS CHANNEL(*) CHLTYPE(SDR)\n"
+        mqsc_status  = "DIS CHSTATUS(*) WHERE(CHLTYPE EQ SDR)\n"
+
+        channels_defined_all: Dict[str, Dict[str, Dict[str, str]]] = {}
+        channels_status_all: Dict[str, Dict[str, Dict[str, str]]] = {}
+        channels_merged_all: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        rx_def = re.compile(r"CHANNEL\(([^)]+)\)\s+CHLTYPE\(([^)]+)\)", re.IGNORECASE)
+
+        for qm in active_qms:
+            # 1) Defined SDR channels
+            rc_def, out_def = run_runmqsc(qm, mqsc_defined, timeout_s=RUNMQSC_TIMEOUT_S)
+            if rc_def != 0:
+                frag["findings"].append(Finding(
+                    priority="P2",
+                    assignment_group="OPS",
+                    reason_code="RUNMQSC_FAIL",
+                    domain="mq",
+                    summary=f"runmqsc failed (DIS CHANNEL) for {qm} rc={rc_def}: {(out_def.strip() or 'no output')[:200]}",
+                    node=hostname,
+                    qm=qm,
+                ).to_dict())
+                channels_defined_all[qm] = {}
+            else:
+                defined: Dict[str, Dict[str, str]] = {}
+                for line in out_def.splitlines():
+                    mm = rx_def.search(line)
+                    if not mm:
+                        continue
+                    ch = mm.group(1).strip()
+                    if ch == "*":
+                        continue
+                    chltype = mm.group(2).strip().upper()
+                    if chltype == "SDR":
+                        defined[ch] = {"chltype": "SDR"}
+                channels_defined_all[qm] = defined
+
+            # 2) Status records for SDR channels
+            rc_st, out_st = run_runmqsc(qm, mqsc_status, timeout_s=RUNMQSC_TIMEOUT_S)
+            if rc_st != 0:
+                if "AMQ8420I" in (out_st or ""):
+                    channels_status_all[qm] = {}
+                else:
+                    frag["findings"].append(Finding(
+                    priority="P2",
+                    assignment_group="OPS",
+                    reason_code="RUNMQSC_FAIL",
+                    domain="mq",
+                    summary=f"runmqsc failed (DIS CHSTATUS) for {qm} rc={rc_st}: {(out_st.strip() or 'no output')[:200]}",
+                    node=hostname,
+                    qm=qm,
+                ).to_dict())
+                channels_status_all[qm] = {}
+            else:
+                ch_map, errs = parse_runmqsc_chstatus_sdr(out_st)
+                channels_status_all[qm] = ch_map
+                # AMQ8420I is common/expected; only record other AMQ messages.
+                if errs:
+                    non_8420 = [e for e in errs if "AMQ8420I" not in e]
+                    if non_8420:
+                        frag["findings"].append(Finding(
+                            priority="P4",
+                            assignment_group="OPS",
+                            reason_code="RUNMQSC_AMQ_MESSAGES",
+                            domain="mq",
+                            summary=f"{qm} runmqsc returned AMQ messages (count={len(non_8420)}), review if unexpected",
+                            node=hostname,
+                            qm=qm,
+                        ).to_dict())
+                        frag["discovery"].setdefault("runmqsc_amq_sample", {})[qm] = non_8420[:5]
+
+            # Merge
+            merged: Dict[str, Dict[str, Any]] = {}
+            defined_names = set(channels_defined_all.get(qm, {}).keys())
+            status_names = set(channels_status_all.get(qm, {}).keys())
+            for ch in sorted(defined_names | status_names):
+                entry: Dict[str, Any] = {"chltype": "SDR"}
+                entry["defined"] = ch in defined_names
+                entry["status"] = (channels_status_all.get(qm, {}).get(ch, {}) or {}).get("status", "NO_STATUS") if ch in status_names else "NO_STATUS"
+                entry["is_system"] = ch.upper().startswith("SYSTEM.")
+                merged[ch] = entry
+            channels_merged_all[qm] = merged
+
+        frag["discovery"]["channels_sdr_defined"] = channels_defined_all
+        frag["discovery"]["channels_sdr_status"] = channels_status_all
+        frag["discovery"]["channels_sdr"] = channels_merged_all
+
+        # Step 2B: Rules evaluation for required SDR channels (config-driven)
+        try:
+            cfg = load_or_bootstrap_config(args.root, active_qms)
+            frag["discovery"]["config_path"] = config_path(args.root)
+        except Exception as e:
+            cfg = default_config()
+            frag["warnings"].append(f"Config load/bootstrap failed: {e}")
+
+        for qm in active_qms:
+            sdr_map = channels_merged_all.get(qm, {}) if isinstance(channels_merged_all.get(qm, {}), dict) else {}
+            for finding in evaluate_required_sdr_channels(cfg, qm, sdr_map, hostname):
+                frag["findings"].append(finding.to_dict())
+
+        # Step 3Q: Queue discovery (depth) + evaluation + learning
+        try:
+            qdisc_all: Dict[str, Dict[str, Any]] = {}
+            for qm in active_qms:
+                mqsc_q = "DIS QLOCAL(*) CURDEPTH MAXDEPTH\n"
+                rcq, outq = run_runmqsc(qm, mqsc_q, timeout_s=RUNMQSC_TIMEOUT_S)
+                if rcq != 0:
+                    frag["findings"].append(Finding(
+                        priority="P2",
+                        assignment_group="OPS",
+                        reason_code="RUNMQSC_FAIL",
+                        domain="mq.queues",
+                        summary=f"runmqsc failed (DIS QLOCAL) for {qm} rc={rcq}: {(outq.strip() or 'no output')[:200]}",
+                        node=hostname,
+                        qm=qm,
+                    ).to_dict())
+                    qdepths = {}
+                else:
+                    qdepths = parse_dis_qlocal_curdepth(outq)
+
+                qdisc_all[qm] = qdepths
+
+                for qf in evaluate_queue_depths(args.root, cfg, qm, qdepths, hostname):
+                    frag["findings"].append(qf.to_dict())
+
+            # Flow / staleness: depth unchanged across runs (configurable)
+            for ff in update_queue_flow_state(args.root, cfg, qm, qdepths, hostname):
+                frag["findings"].append(ff.to_dict())
+
+            frag["discovery"]["queues_local"] = qdisc_all
+        except Exception as e:
+            frag["warnings"].append(f"Queue monitoring failed: {e}")
+    else:
+        frag["discovery"]["channels_sdr"] = {}
+    if args.simulate_seconds > 0:
+        time.sleep(args.simulate_seconds)
+
+    end = utc_now()
+    frag["run_end"] = iso(end)
+    frag["status"] = "OK"
+
+    try:
+        atomic_write_json(frag_json, frag)
+        atomic_write_text(hb, iso(end) + "\n")
+    except Exception as e:
+        write_breadcrumb(f"run(node{args.node_id}) failed writing final fragment/heartbeat: {e}")
+        return 2
+
+    return 0
+
+def aggregate_fragments(root: str, nodes: List[int]) -> Tuple[Dict[int, Optional[Dict[str, Any]]], List[Finding]]:
+    now = utc_now()
+    findings: List[Finding] = []
+    frags: Dict[int, Optional[Dict[str, Any]]] = {}
+
+    for nid in nodes:
+        frag_json, _hb = fragment_paths(root, nid)
+        frag = read_json_file(frag_json)
+        frags[nid] = frag
+        if frag is None:
+            findings.append(Finding("P2","OPS","FRAGMENT_MISSING","framework",f"Missing fragment for node{nid} ({frag_json})"))
+            continue
+
+        run_end = frag.get("run_end")
+        dt_end = parse_iso(run_end) if isinstance(run_end, str) else None
+        if dt_end is None:
+            findings.append(Finding("P2","OPS","FRAGMENT_INVALID","framework",f"Invalid fragment timestamps for node{nid}",node=frag.get("hostname")))
+            continue
+
+        age_min = (now - dt_end.astimezone(_dt.timezone.utc)).total_seconds() / 60.0
+        if age_min > FRAGMENT_STALE_MINUTES:
+            findings.append(Finding("P2","OPS","FRAGMENT_STALE","framework",f"Stale fragment for node{nid}: last update {age_min:.1f} minutes ago",node=frag.get("hostname")))
+
+        for w in (frag.get("warnings") or [])[:10]:
+            findings.append(Finding("P4","OPS","NODE_WARNING","framework",f"node{nid} warning: {w}",node=frag.get("hostname")))
+
+    return frags, findings
+
+def summarize_counts(findings: List[Finding]) -> Dict[str, Dict[str, int]]:
+    counts: Dict[str, Dict[str, int]] = {}
+    for f in findings:
+        counts.setdefault(f.assignment_group, {}).setdefault(f.priority, 0)
+        counts[f.assignment_group][f.priority] += 1
+    return counts
+
+def build_qm_location_summary(frags: Dict[int, Optional[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    for frag in frags.values():
+        if not frag:
+            continue
+        host = frag.get("hostname")
+        rdqm = (frag.get("discovery") or {}).get("rdqm") or {}
+        if not isinstance(rdqm, dict):
+            continue
+        for qm, info in rdqm.items():
+            if not isinstance(info, dict):
+                continue
+            loc = info.get("ha_current_location", "")
+            qm_status = info.get("qm_status", "")
+            if loc == "This node" or (qm_status == "Running" and loc.lower() == "this node"):
+                summary.setdefault(qm, {})
+                summary[qm]["active_host"] = host
+                summary[qm]["ha_status"] = info.get("ha_status")
+                summary[qm]["preferred"] = info.get("ha_preferred_location")
+                summary[qm]["blocked"] = info.get("ha_blocked_location")
+                summary[qm]["qm_status"] = info.get("qm_status")
+    return summary
+
+def cmd_aggregate(args: argparse.Namespace) -> int:
+    hostname = socket.gethostname()
+    nodes = DEFAULT_NODES if args.nodes is None else args.nodes
+    frags, agg_findings = aggregate_fragments(args.root, nodes)
+
+    for frag in frags.values():
+        if not frag:
+            continue
+        for fd in (frag.get("findings") or []):
+            try:
+                agg_findings.append(Finding(
+                    priority=fd["priority"],
+                    assignment_group=fd.get("assignment_group", "OPS"),
+                    reason_code=fd.get("reason_code", "UNKNOWN"),
+                    domain=fd.get("domain", "unknown"),
+                    summary=fd.get("summary", ""),
+                    node=fd.get("node"),
+                    qm=fd.get("qm"),
+                ))
+            except Exception:
+                continue
+
+    end = utc_now()
+    qms = build_qm_location_summary(frags)
+
+    instance = {
+        "schema": 1,
+        "version": VERSION,
+        "generated_at": iso(end),
+        "aggregator_host": hostname,
+        "nodes": {},
+        "qms": qms,
+        "counts": summarize_counts(agg_findings),
+        "findings": [f.to_dict() for f in agg_findings],
+        "notes": {"self_heal": "disabled"},
+    }
+
+    for nid in nodes:
+        frag = frags.get(nid)
+        if frag is None:
+            instance["nodes"][f"node{nid}"] = {"status": "MISSING"}
+        else:
+            instance["nodes"][f"node{nid}"] = {
+                "hostname": frag.get("hostname"),
+                "status": frag.get("status", "UNKNOWN"),
+                "run_end": frag.get("run_end"),
+                "run_id": frag.get("run_id"),
+            }
+
+    try:
+        out = instance_path(args.root)
+        ensure_dir(os.path.dirname(out))
+        atomic_write_json(out, instance)
+        atomic_write_text(instance_hb_path(args.root), iso(end) + "\n")
+    except Exception as e:
+        write_breadcrumb(f"aggregate failed writing instance output to {args.root}: {e}")
+        return 2
+    return 0
+
+def cmd_status(args: argparse.Namespace) -> int:
+    inst = read_json_file(instance_path(args.root))
+    print(f"Root: {args.root}")
+    if not inst:
+        print("INSTANCE.json: missing")
+        return 1
+    print(f"INSTANCE.json: generated_at={inst.get('generated_at')} version={inst.get('version')} aggregator={inst.get('aggregator_host')}")
+
+    qms = inst.get("qms") or {}
+    if qms:
+        print("\nQM active locations:")
+        for qm in sorted(qms.keys()):
+            print(f"  {qm}: {qms[qm].get('active_host')} (HA={qms[qm].get('ha_status')})")
+
+    findings = inst.get("findings") or []
+    if findings:
+        print("\nTop findings:")
+        for f in findings[:15]:
+            qm = f.get("qm")
+            qm_part = f" [{qm}]" if qm else ""
+            print(f"  {f.get('priority')} {f.get('assignment_group')} {f.get('reason_code')}{qm_part}: {f.get('summary')}")
+    return 0
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ipsb-hc")
+    p.add_argument("--root", default=DEFAULT_ROOT)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run")
+    p_run.add_argument("--node-id", type=int, required=True)
+    p_run.add_argument("--simulate-seconds", type=int, default=0)
+    p_run.set_defaults(func=cmd_run)
+
+    p_agg = sub.add_parser("aggregate")
+    p_agg.add_argument("--node-id", type=int, required=True)
+    p_agg.add_argument("--nodes", type=int, nargs="*", default=None)
+    p_agg.set_defaults(func=cmd_aggregate)
+
+    p_stat = sub.add_parser("status")
+    p_stat.set_defaults(func=cmd_status)
+    return p
+
+def main(argv: List[str]) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

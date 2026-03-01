@@ -1,0 +1,15 @@
+# IPSB HC2 Global Configuration (Scaffold)
+schema: 1
+version: "0.1.0-scaffold"
+
+defaults:
+  self_heal:
+    enabled: false
+
+cluster:
+  nodes: [1, 2, 3]
+  fragment_stale_minutes: 15
+
+paths:
+  fragments_dir: "fragments"
+  instance_dir: "instance"
