@@ -69,9 +69,6 @@ def utc_now() -> _dt.datetime:
 def iso(dt: _dt.datetime) -> str:
     return dt.astimezone(_dt.timezone.utc).isoformat()
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
 def atomic_write_text(path: str, content: str) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -111,6 +108,7 @@ class Finding:
     summary: str
     node: Optional[str] = None
     qm: Optional[str] = None
+    queue: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -123,6 +121,8 @@ class Finding:
         }
         if self.qm:
             d["qm"] = self.qm
+        if self.queue:
+            d["queue"] = self.queue
         return d
 
 def read_json_file(path: str) -> Optional[Dict[str, Any]]:
@@ -192,24 +192,13 @@ def load_or_bootstrap_config(root: str, discovered_qms: List[str]) -> Dict[str, 
                 "ignore_channel_patterns": [],
                 "required_sdr_channels": [],
                 "required_sdr_patterns": [],
-            "ignore_queue_patterns": ["SYSTEM.*", "AMQ.*"],
-            "required_queues": [],
-            "required_queue_patterns": [],
-            "queue_thresholds": {
-                "depth_warn": 500,
-                "depth_crit": 1000,
-                "pct_maxdepth_crit": 95
-            },
-            "queue_severity": {
-                "missing_required": "P2"
-            },
-            "queue_routing": {},
                 "routing": {},
                 "severity": {},
                 "ignore_queue_patterns": [],
                 "required_queues": [],
                 "required_queue_patterns": [],
                 "queue_thresholds": {},
+                "queue_severity": {},
                 "queue_overrides": {},
                 "queue_pattern_overrides": [],
                 "queue_routing": {},
@@ -341,11 +330,7 @@ def evaluate_required_sdr_channels(
 
 # ---- Queue Monitoring (Step 3Q) ----------------------------------------------
 
-def state_dir(root: str) -> str:
-    return os.path.join(root, "state")
-
 def queue_state_path(root: str, qm: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", qm)
     return os.path.join(state_dir(root), f"{safe_name(qm)}_queue_seen.json")
 
 def load_queue_state(root: str, qm: str) -> Dict[str, Any]:
@@ -1018,9 +1003,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 for qf in evaluate_queue_depths(args.root, cfg, qm, qdepths, hostname):
                     frag["findings"].append(qf.to_dict())
 
-            # Flow / staleness: depth unchanged across runs (configurable)
-            for ff in update_queue_flow_state(args.root, cfg, qm, qdepths, hostname):
-                frag["findings"].append(ff.to_dict())
+                # Flow / staleness: depth unchanged across runs (configurable)
+                for ff in update_queue_flow_state(args.root, cfg, qm, qdepths, hostname):
+                    frag["findings"].append(ff.to_dict())
 
             frag["discovery"]["queues_local"] = qdisc_all
         except Exception as e:
